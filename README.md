@@ -5,25 +5,23 @@
 [![Kotlin](https://img.shields.io/badge/Kotlin-1.9.0-purple.svg)](https://kotlinlang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A production-grade, real-time **speech-to-speech** translation system optimized for Indian languages and mobile environments. FLOAT provides seamless, low-latency translation using **SeamlessM4T v2** direct audio-to-audio translation with advanced audio preprocessing and streaming illusion.
+A production-grade, real-time **speech-to-speech** translation system optimized for Indian languages and mobile environments. FLOAT provides seamless, network-dependent translation using **SeamlessM4T v2** direct audio-to-audio translation with **client-side perceptual processing** and **chunked request/response** communication.
 
 ## 🌟 Features
 
 ### Core Capabilities
-- **Real-time S2S Translation**: Sub-1.5 second end-to-end latency using SeamlessM4T v2
+- **Network-Dependent S2S Translation**: End-to-end latency varies with network conditions using SeamlessM4T v2
 - **14 Indian Languages**: Hindi, Bengali, Telugu, Tamil, Marathi, Gujarati, Kannada, Malayalam, Punjabi, Urdu, Assamese, Odia, Sindhi, and more
 - **Direct Audio Translation**: No intermediate text processing - pure speech-to-speech pipeline
-- **Advanced Audio Preprocessing**: WebRTC-style noise suppression, AGC, band-pass filtering
-- **Speech-Probability VAD**: Advanced voice activity detection with multiple features
-- **Emotion Flattening**: Phase 1 implementation for optimal translation accuracy
-- **Intelligent Chunking**: 100-300ms chunks with 200-300ms overlap for context
-- **Streaming Illusion**: Progressive playback with controlled buffering
+- **Client-Side Audio Processing**: Instagram-style perceptual smoothing on client device
+- **Chunked Communication**: 100-300ms chunks with 200-300ms overlap for context
+- **Graceful Failure Handling**: Silent fallbacks and error recovery
 
 ### Technical Excellence
 - **Android 13/14 Compliant**: Proper foreground service implementation
 - **Material 3 Design**: Glassmorphism UI with dark theme optimization
-- **Concurrent Processing**: Hundreds of simultaneous WebSocket connections
-- **Robust Error Handling**: 15+ specific error scenarios with recovery
+- **Concurrent Processing**: Multiple simultaneous WebSocket connections
+- **Robust Error Handling**: Network-aware error scenarios with recovery
 - **Power Resilient**: Handles OEM background restrictions and battery optimization
 - **Production Ready**: Docker deployment with monitoring and observability
 
@@ -59,14 +57,14 @@ A production-grade, real-time **speech-to-speech** translation system optimized 
 - **Language**: Kotlin with Coroutines
 - **UI**: Jetpack Compose with Material 3
 - **Architecture**: MVVM with Hilt DI
-- **Audio**: Advanced preprocessing (WebRTC-style)
+- **Audio**: Client-side perceptual processing (Instagram-style)
 - **Networking**: OkHttp WebSocket with Exponential Backoff
 - **Translation**: SeamlessM4T v2 via Hugging Face API
 
 #### Backend Server
 - **Framework**: FastAPI with asyncio
 - **ML**: Hugging Face SeamlessM4T v2 API
-- **Audio Processing**: scipy-based preprocessing
+- **Audio Processing**: Peak safety normalization only
 - **Infrastructure**: Docker, aiohttp, Prometheus
 - **Deployment**: uvicorn with health monitoring
 
@@ -182,25 +180,22 @@ A production-grade, real-time **speech-to-speech** translation system optimized 
 
 ```
 float/
-├── android/                          # Android client application
-│   ├── src/main/kotlin/com/float/app/
-│   │   ├── audio/                    # Advanced audio processing
-│   │   │   ├── AEC_VAD_Processor.kt        # WebRTC-style preprocessing
-│   │   │   ├── SeamlessM4T_Processor.kt     # S2S translation client
-│   │   │   └── TTS_Serial_Engine.kt        # Audio playback engine
-│   │   ├── data/                     # Data models and contracts
-│   │   │   ├── SessionModel.kt
-│   │   │   └── ErrorModel.kt
-│   │   ├── di/                       # Dependency injection
-│   │   │   └── AppDispatchers.kt
-│   │   ├── manager/                  # Business logic managers
-│   │   │   └── LanguagePairManager.kt
-│   │   ├── network/                  # Networking components
-│   │   │   └── TranslatorWebSocket.kt
-│   │   ├── service/                  # Android services
-│   │   │   ├── FloatOverlayService.kt
-│   │   │   └── AccessibilityDetector.kt
-│   │   └── ui/                      # UI components
+├── src/main/kotlin/com/float/app/
+│   ├── audio/                    # Client-side audio processing
+│   │   └── StreamingAudioBuffer.kt     # Instagram-style perceptual processing
+│   ├── data/                     # Data models and contracts
+│   │   ├── SessionModel.kt
+│   │   └── ErrorModel.kt
+│   ├── di/                       # Dependency injection
+│   │   └── AppDispatchers.kt
+│   ├── manager/                  # Business logic managers
+│   │   └── LanguagePairManager.kt
+│   ├── network/                  # Networking components
+│   │   └── TranslatorWebSocket.kt
+│   ├── service/                  # Android services
+│   │   ├── FloatOverlayService.kt
+│   │   └── AccessibilityDetector.kt
+│   ├── ui/                      # UI components
 │   │       ├── MainActivity.kt
 │   │       ├── TranslatorScreen.kt
 │   │       └── components/
@@ -208,7 +203,7 @@ float/
 │   └── build.gradle                  # Android build configuration
 ├── backend/                          # FastAPI backend server
 │   ├── main.py                      # FastAPI application entry point
-│   ├── translation_processor.py       # SeamlessM4T v2 S2S processor
+│   ├── translation_processor.py       # SeamlessM4T v2 S2S processor (peak safety only)
 │   ├── models.py                    # Pydantic data models
 │   ├── requirements.txt              # Python dependencies
 │   ├── Dockerfile                   # Container configuration
@@ -228,20 +223,14 @@ float/
 
 **Audio Processing Pipeline**
 ```kotlin
-// Audio capture with echo cancellation
-val audioProcessor = AEC_VAD_Processor(appDispatchers)
-audioProcessor.initializeAudio()
-audioProcessor.startAudioCapture()
+// Client-side audio processing with Instagram-style smoothing
+val streamingBuffer = StreamingAudioBuffer()
+streamingBuffer.initialize()
 
-// Speech-to-text processing
-val sttProcessor = VoskSTTProcessor(context, appDispatchers)
-sttProcessor.initialize("hi") // Hindi
-val result = sttProcessor.processAudioChunk(audioData)
+// Add audio chunk for processing and playback
+streamingBuffer.addAudioChunk(audioData)
 
-// Text-to-speech synthesis
-val ttsEngine = TTS_Serial_Engine(context, appDispatchers)
-ttsEngine.initialize(Locale("hi", "IN"))
-ttsEngine.speak("नमस्ते दुनिया!")
+// Processing includes: cross-fade, normalization, compression, emotion flattening
 ```
 
 **WebSocket Communication**
@@ -287,13 +276,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 ```
 
 #### Translation Processing
-
 ```python
-# Initialize translation processor
-processor = TranslationProcessor()
-await processor.initialize()
+# Initialize translation processor (peak safety only)
+processor = SeamlessM4TProcessor()
+await processor.initialize(api_key="your_key")
 
-# Translate audio chunk
+# Translate audio chunk (backend only ensures safety)
 result = await processor.translate_audio(
     audio_data=base64_audio,
     source_language="en",
@@ -361,7 +349,7 @@ python benchmark.py --concurrent=50 --requests=1000
 ### Production Metrics
 
 **Key Performance Indicators**
-- **End-to-end Latency**: Target ≤ 1.5 seconds
+- **End-to-end Latency**: Network-dependent, typically 1-3 seconds
 - **Connection Success Rate**: Target ≥ 99.5%
 - **Translation Accuracy**: Target ≥ 92% for major Indian languages
 - **Memory Usage**: Target ≤ 200MB on mid-range devices

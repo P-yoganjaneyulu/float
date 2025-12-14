@@ -21,15 +21,14 @@ Traditional mobile translation suffers from four major failures that FLOAT must 
 
 ## 3. Production Architecture (SeamlessM4T v2 S2S)
 
-FLOAT uses a **Direct Speech-to-Speech Architecture** to achieve the target latency of ≤ 1.5 seconds end-to-end, leveraging the state-of-the-art SeamlessM4T v2 model for direct audio-to-audio translation.
+FLOAT uses a **Network-Dependent Speech-to-Speech Architecture** to achieve target latency of typically 1-3 seconds end-to-end, leveraging **SeamlessM4T v2** for direct audio-to-audio translation with **CLIENT-SIDE PERCEPTUAL PROCESSING**.
 
 | Component | Function | Location | Rationale |
 | :--- | :--- | :--- | :--- |
-| **Audio Preprocessing** | Noise suppression, AGC, band-pass filtering | **Offline (On-Device)** | Uses **WebRTC-style algorithms** for clean, normalized audio input |
-| **Advanced VAD** | Speech-probability based detection | **Offline (On-Device)** | Multi-feature VAD (energy, ZCR, spectral, voicing) for accurate speech detection |
-| **Translation** | Direct speech-to-speech translation | **Cloud (Hugging Face API)** | Uses **SeamlessM4T v2** for end-to-end S2S translation, eliminating text intermediate |
-| **Audio Post-processing** | Cross-fading, normalization | **Offline (On-Device)** | Ensures smooth, continuous audio playback |
-| **Orchestration** | Manages the flow and state | **Android Kotlin Services** | Ensures strict concurrency, error handling, and lifecycle management |
+| **Audio Chunk Capture** | Basic audio capture | Android Kotlin Services | Simple capture - no preprocessing |
+| **Network Communication** | WebSocket chunked requests | Android Kotlin Network | Send 100-300ms chunks to backend |
+| **Backend S2S** | Direct speech-to-speech | FastAPI + Hugging Face API | Peak safety normalization only |
+| **Client-Side Processing** | Instagram-style perceptual smoothing | StreamingAudioBuffer.kt | Cross-fade, normalization, compression, emotion flattening |
 
 ### ✅ IMPLEMENTED CHANGES
 
@@ -101,8 +100,9 @@ FLOAT uses a **Direct Speech-to-Speech Architecture** to achieve the target late
 
 ### 4.1. Audio & Concurrency Discipline
 
-* **Latency Target:** End-to-end user-perceived delay $\le 1.5$ seconds.
-* **AEC/Ducking Policy:** **Must implement audio ducking/muting** (`AEC_VAD_Processor`) to silence the microphone input stream during native TTS playback, preventing immediate feedback loops and self-echo.
+* **Latency Target:** End-to-end user-perceived delay typically 1-3 seconds (network-dependent).
+* **Client-Side Processing:** All perceptual audio processing (cross-fade, normalization, compression, emotion flattening) handled by StreamingAudioBuffer.kt.
+* **No Audio Feedback Loops:** Backend performs only peak safety normalization - no audio feedback on client side.
 * **VAD-Driven Chunking:** Audio is processed using VAD and chunked into small frames ($\le 300\text{ms}$) before sending over the WebSocket to maintain streaming reactivity.
 * **Concurrency Rules (Kotlin Coroutines):**
     * **`Dispatchers.IO`**: Exclusively for all high-latency tasks (Audio I/O, Vosk STT, Network).
