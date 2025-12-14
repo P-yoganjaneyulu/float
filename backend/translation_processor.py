@@ -377,10 +377,44 @@ class SeamlessM4TProcessor:
             raise ProcessorError(f"Failed to parse API response: {str(e)}")
     
     def _postprocess_audio(self, audio_data: bytes) -> bytes:
-        """Post-process translated audio for smooth playback."""
-        # For now, just return the audio as-is
-        # In future, this could implement cross-fading, normalization, etc.
-        return audio_data
+        """
+        Minimal peak safety normalization for backend.
+        
+        Backend only ensures audio safety - all perceptual processing
+        (cross-fades, normalization, compression, emotion flattening)
+        is handled client-side in playback buffer.
+        """
+        try:
+            # Convert bytes to numpy array (assuming 16-bit PCM)
+            audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # Only apply peak safety normalization to prevent clipping
+            processed_audio = self._apply_peak_safety_normalization(audio_array)
+            
+            # Convert back to 16-bit PCM
+            processed_int16 = (processed_audio * 32767.0).astype(np.int16)
+            return processed_int16.tobytes()
+            
+        except Exception as e:
+            logger.error(f"Audio post-processing failed: {e}")
+            # Return original audio if post-processing fails
+            return audio_data
+    
+    def _apply_peak_safety_normalization(self, audio: np.ndarray) -> np.ndarray:
+        """Apply minimal peak safety normalization to prevent clipping."""
+        if len(audio) == 0:
+            return audio
+        
+        # Find peak amplitude
+        peak_amplitude = np.max(np.abs(audio))
+        
+        # Only normalize if peak exceeds safe threshold
+        max_safe_amplitude = 0.95
+        if peak_amplitude > max_safe_amplitude:
+            scale = max_safe_amplitude / peak_amplitude
+            return audio * scale
+        
+        return audio
     
     def _extract_text_placeholder(self, audio_data: bytes) -> str:
         """Extract text from audio for UI display (placeholder)."""

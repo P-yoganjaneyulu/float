@@ -10,6 +10,16 @@ from pydantic import BaseModel, Field
 from enum import Enum
 
 
+class ProcessorError(Exception):
+    """Custom exception for translation processor errors."""
+    pass
+
+
+class ModelLoadError(ProcessorError):
+    """Exception raised when model loading fails."""
+    pass
+
+
 class MessageType(str, Enum):
     """WebSocket message types."""
     AUDIO_CHUNK = "audio_chunk"
