@@ -69,6 +69,20 @@ class StreamingAudioBuffer {
         BUFFERING
     }
     
+    interface LatencyCallback {
+        fun onChunkProcessed(processingTimeMs: Float)
+        fun onPlaybackStarted()
+    }
+    
+    private var latencyCallback: LatencyCallback? = null
+    
+    /**
+     * Set latency callback for internal monitoring.
+     */
+    fun setLatencyCallback(callback: LatencyCallback) {
+        latencyCallback = callback
+    }
+    
     /**
      * Initialize audio buffer and playback system.
      */
@@ -110,9 +124,11 @@ class StreamingAudioBuffer {
         
         audioQueue.offer(chunk)
         
-        // Update latency metric
+        // Update latency metric and notify callback
         val processingTime = System.currentTimeMillis() - startTime
         _latencyMs.value = processingTime.toFloat()
+        
+        latencyCallback?.onChunkProcessed(processingTime.toFloat())
         
         // Start playback if not already playing
         if (!isPlaying && audioQueue.isNotEmpty()) {
@@ -344,6 +360,9 @@ class StreamingAudioBuffer {
         playbackJob = CoroutineScope(Dispatchers.IO).launch {
             isPlaying = true
             _playbackState.value = PlaybackState.PLAYING
+            
+            // Notify callback when playback starts
+            latencyCallback?.onPlaybackStarted()
             
             audioTrack?.play()
             

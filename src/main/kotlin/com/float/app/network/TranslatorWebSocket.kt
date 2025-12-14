@@ -148,6 +148,27 @@ class TranslatorWebSocket @Inject constructor(
     }
     
     /**
+     * Set latency callback for internal monitoring.
+     */
+    fun setLatencyCallback(callback: WebSocketLatencyCallback) {
+        latencyCallback = callback
+    }
+    
+    /**
+     * Initialize WebSocket client with configuration.
+     */
+    fun initialize(webSocketConfig: WebSocketConfig) {
+        config = webSocketConfig
+        
+        okHttpClient = OkHttpClient.Builder()
+            .connectTimeout(config.connectionTimeout, TimeUnit.MILLISECONDS)
+            .readTimeout(config.connectionTimeout, TimeUnit.MILLISECONDS)
+            .pingInterval(30000, TimeUnit.MILLISECONDS) // 30 second ping interval
+            .retryOnConnectionFailure(true)
+            .build()
+    }
+    
+    /**
      * Connect to WebSocket server with session initialization.
      */
     suspend fun connect(languagePair: LanguagePair): Boolean {
@@ -221,11 +242,15 @@ class TranslatorWebSocket @Inject constructor(
                 session_id = session.sessionId,
                 chunk_index = chunkIndex++,
                 language_pair = session.languagePair,
-                audio_chunk = base64Audio
+                audio_chunk = base64Audio,
+                timestamp = System.currentTimeMillis()
             )
             
             val messageJson = json.encodeToString(outboundMessage)
             val success = webSocket?.send(messageJson) ?: false
+            
+            // Notify latency callback of network send
+            latencyCallback?.onNetworkSend(outboundMessage.timestamp)
             
             if (success) {
                 // Update session stats

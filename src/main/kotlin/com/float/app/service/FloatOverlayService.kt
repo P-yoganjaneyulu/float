@@ -15,8 +15,8 @@ import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
-import com.float.app.data.ErrorModel
-import com.float.app.data.LanguagePair
+import com.float.app.audio.StreamingAudioBuffer
+import com.float.app.audio.StreamingAudioBuffer.LatencyCallback
 import com.float.app.di.AppDispatchers
 import com.float.app.manager.LanguagePairManager
 import com.float.app.network.TranslatorWebSocket
@@ -66,7 +66,7 @@ data class AudioCaptureState(
  * Integrates all audio, network, and manager components into a cohesive service.
  */
 @AndroidEntryPoint
-class FloatOverlayService : LifecycleService() {
+class FloatOverlayService : LifecycleService(), LatencyCallback {
     
     @Inject
     lateinit var webSocket: TranslatorWebSocket
@@ -91,6 +91,20 @@ class FloatOverlayService : LifecycleService() {
     
     private val _currentError = MutableStateFlow<ErrorModel?>(null)
     val currentError: StateFlow<ErrorModel?> = _currentError.asStateFlow()
+    
+    // Internal latency tracking (for monitoring only)
+    private val _internalLatencyMetrics = MutableStateFlow<InternalLatencyMetrics?>(null)
+    val internalLatencyMetrics: StateFlow<InternalLatencyMetrics?> = _internalLatencyMetrics.asStateFlow()
+    
+    data class InternalLatencyMetrics(
+        val micChunkReady: Long = 0,
+        val networkSend: Long = 0,
+        val networkReceive: Long = 0,
+        val playbackStart: Long = 0,
+        val totalLatencyMs: Float = 0f,
+        val networkLatencyMs: Float = 0f,
+        val processingLatencyMs: Float = 0f
+    )
     
     // Service lifecycle management
     private var networkMonitoringJob: Job? = null
@@ -171,6 +185,9 @@ class FloatOverlayService : LifecycleService() {
                 // Initialize core components only
                 val bufferInitialized = streamingBuffer.initialize()
                 
+                // Set latency callback for internal tracking
+                streamingBuffer.setLatencyCallback(this)
+                
                 if (!bufferInitialized) {
                     throw IllegalStateException("Failed to initialize core components")
                 }
@@ -198,7 +215,7 @@ class FloatOverlayService : LifecycleService() {
      */
     private fun setupComponentIntegrations() {
         serviceScope.launch {
-            // Network state monitoring only
+            // Network state monitoring with latency tracking
             networkMonitoringJob = launch {
                 webSocket.connectionState.collect { connectionState ->
                     val isOnline = connectionState.state.name == "CONNECTED"
@@ -210,9 +227,48 @@ class FloatOverlayService : LifecycleService() {
                     } else if (isOnline && isOfflineMode) {
                         exitOfflineMode()
                     }
+                    
+                    // Update latency metrics when connection changes
+                    updateLatencyMetrics()
                 }
+                
+                // Test latency tracking
+                simulateMicChunkReady()
             }
         }
+    }
+    
+    /**
+     * Update internal latency metrics for monitoring.
+     */
+    private fun updateLatencyMetrics() {
+        val currentMetrics = _internalLatencyMetrics.value
+        if (currentMetrics != null && currentMetrics.playbackStart > 0) {
+            val now = System.currentTimeMillis()
+            val totalLatency = now - currentMetrics.micChunkReady
+            
+            _internalLatencyMetrics.value = currentMetrics.copy(
+                totalLatencyMs = totalLatency.toFloat(),
+                networkLatencyMs = currentMetrics.networkLatencyMs,
+                processingLatencyMs = currentMetrics.processingLatencyMs
+            )
+        }
+    }
+    
+    /**
+     * Simulate mic chunk ready for testing.
+     */
+    private fun simulateMicChunkReady() {
+        val now = System.currentTimeMillis()
+        _internalLatencyMetrics.value = InternalLatencyMetrics(
+            micChunkReady = now,
+            networkSend = now,
+            networkReceive = now,
+            playbackStart = 0,
+            totalLatencyMs = 0f,
+            networkLatencyMs = 0f,
+            processingLatencyMs = 0f
+        )
     }
     
     /**
@@ -483,5 +539,26 @@ class FloatOverlayService : LifecycleService() {
     override fun onDestroy() {
         super.onDestroy()
         handleStopService()
+    }
+    
+    // LatencyCallback implementation
+    override fun onChunkProcessed(processingTimeMs: Float) {
+        val currentMetrics = _internalLatencyMetrics.value
+        if (currentMetrics != null) {
+            val updatedMetrics = currentMetrics.copy(
+                processingLatencyMs = processingTimeMs
+            )
+            _internalLatencyMetrics.value = updatedMetrics
+        }
+    }
+    
+    override fun onPlaybackStarted() {
+        val currentMetrics = _internalLatencyMetrics.value
+        if (currentMetrics != null) {
+            val updatedMetrics = currentMetrics.copy(
+                playbackStart = System.currentTimeMillis()
+            )
+            _internalLatencyMetrics.value = updatedMetrics
+        }
     }
 }
