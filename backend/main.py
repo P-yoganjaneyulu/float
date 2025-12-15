@@ -28,7 +28,7 @@ from slowapi.errors import RateLimitExceeded
 from translation_processor import SeamlessM4TProcessor, ProcessorError, ModelLoadError
 from models import (
     InboundMessage, OutboundMessage, TranslationResult,
-    SessionInfo, ServerError, ConnectionStats
+    SessionInfo, ServerError, ConnectionStats, MessageType
 )
 
 # Configure structured logging
@@ -127,7 +127,8 @@ class WebSocketManager:
             "connected_at": datetime.utcnow(),
             "last_activity": datetime.utcnow(),
             "message_count": 0,
-            "chunks_processed": 0
+            "chunks_processed": 0,
+            "last_acknowledged_seq": 0  # Track last acknowledged sequence ID
         }
         
         # Update global stats
@@ -166,6 +167,21 @@ class WebSocketManager:
             except Exception as e:
                 logger.error(f"Failed to send message to {session_id}: {e}")
                 self.disconnect(session_id)
+    
+    async def send_acknowledgment(self, session_id: str, sequence_id: int):
+        """Send acknowledgment for received chunk."""
+        ack_message = {
+            "session_id": session_id,
+            "message_type": "ack",
+            "ack_sequence_id": sequence_id,
+            "timestamp": int(time.time() * 1000)
+        }
+        
+        # Update last acknowledged sequence ID
+        if session_id in self.session_metadata:
+            self.session_metadata[session_id]["last_acknowledged_seq"] = sequence_id
+            
+        await self.send_message(session_id, ack_message)
     
     async def broadcast_keepalive(self):
         """Send keepalive messages to all active connections."""
@@ -218,7 +234,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             session_id=session_id,
             language_pair=client_info["language_pair"],
             created_at=datetime.utcnow(),
-            last_activity=datetime.utcnow()
+            last_activity=datetime.utcnow(),
+            last_acknowledged_seq=0
         )
         
         # Send welcome message
@@ -335,10 +352,15 @@ async def process_audio_chunk(session_id: str, message: Dict[str, Any]):
         # Extract audio data
         audio_chunk = message.get("audio_chunk")
         chunk_index = message.get("chunk_index", 0)
+        sequence_id = message.get("sequence_id")
         language_pair = message.get("language_pair", {})
         
         if not audio_chunk:
             raise ValueError("Audio chunk data is required")
+        
+        # Send acknowledgment for received chunk
+        if sequence_id is not None:
+            await websocket_manager.send_acknowledgment(session_id, sequence_id)
         
         # Update session stats
         if session_id in websocket_manager.session_metadata:
@@ -351,7 +373,8 @@ async def process_audio_chunk(session_id: str, message: Dict[str, Any]):
             audio_data=audio_chunk,
             source_language=language_pair.get("source", "en"),
             target_language=language_pair.get("target", "hi"),
-            session_id=session_id
+            session_id=session_id,
+            sequence_id=sequence_id
         )
         
         processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
@@ -361,6 +384,7 @@ async def process_audio_chunk(session_id: str, message: Dict[str, Any]):
             "session_id": session_id,
             "message_type": "final_transcript" if translation_result.is_final else "partial_transcript",
             "chunk_index": chunk_index,
+            "sequence_id": sequence_id,
             "final_transcript" if translation_result.is_final else "partial_transcript": translation_result.text,
             "confidence": translation_result.confidence,
             "processing_time_ms": processing_time,
@@ -376,6 +400,9 @@ async def process_audio_chunk(session_id: str, message: Dict[str, Any]):
             (connection_stats.avg_processing_time * (connection_stats.total_translations - 1) + processing_time) /
             connection_stats.total_translations
         )
+        
+        # Update backpressure stats
+        connection_stats.backpressure_events = translation_processor.backpressure_events
         
         logger.debug(f"Translation completed for {session_id}: {translation_result.text[:50]}...")
         
@@ -481,7 +508,8 @@ async def stats_reporting_task():
             logger.info(f"Server Stats - Connections: {connection_stats.active_connections}, "
                        f"Total Translations: {connection_stats.total_translations}, "
                        f"Success Rate: {connection_stats.get_success_rate():.2%}, "
-                       f"Avg Processing Time: {connection_stats.avg_processing_time:.2f}ms")
+                       f"Avg Processing Time: {connection_stats.avg_processing_time:.2f}ms, "
+                       f"Backpressure Events: {connection_stats.backpressure_events}")
             
             await asyncio.sleep(300)  # Report every 5 minutes
             
@@ -518,7 +546,8 @@ async def get_stats():
             "successful": connection_stats.successful_translations,
             "failed": connection_stats.failed_translations,
             "success_rate": connection_stats.get_success_rate(),
-            "avg_processing_time_ms": connection_stats.avg_processing_time
+            "avg_processing_time_ms": connection_stats.avg_processing_time,
+            "backpressure_events": connection_stats.backpressure_events
         },
         "processor": translation_processor.get_status() if translation_processor else None,
         "sessions": len(active_sessions)
@@ -538,7 +567,8 @@ async def get_sessions():
                 "connected_at": session_info.created_at.isoformat(),
                 "last_activity": session_info.last_activity.isoformat(),
                 "client_ip": metadata.get("client_ip"),
-                "chunks_processed": metadata.get("chunks_processed", 0)
+                "chunks_processed": metadata.get("chunks_processed", 0),
+                "last_acknowledged_seq": metadata.get("last_acknowledged_seq", 0)
             }
     
     return {"sessions": sessions, "total": len(sessions)}

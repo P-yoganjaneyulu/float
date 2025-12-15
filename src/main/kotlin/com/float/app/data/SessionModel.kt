@@ -31,6 +31,7 @@ data class LanguagePair(
 data class OutboundMessage(
     val session_id: String,
     val chunk_index: Int,
+    val sequence_id: Long = System.currentTimeMillis(), // Sequence ID for ordering and ACK
     val language_pair: LanguagePair,
     val audio_chunk: String,  // Base64 encoded audio data
     val timestamp: Long = System.currentTimeMillis()
@@ -43,8 +44,10 @@ data class OutboundMessage(
 @Serializable
 data class InboundMessage(
     val session_id: String,
-    val message_type: String,  // "partial_transcript", "final_transcript", "error", "keepalive"
+    val message_type: String,  // "partial_transcript", "final_transcript", "error", "keepalive", "ack"
     val chunk_index: Int? = null,
+    val sequence_id: Long? = null, // For ACK messages
+    val ack_sequence_id: Long? = null, // Last processed sequence ID from server
     val partial_transcript: String? = null,
     val final_transcript: String? = null,
     val error_code: String? = null,

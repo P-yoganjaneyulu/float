@@ -56,6 +56,7 @@ class SeamlessM4TProcessor:
     - Emotion flattening for Phase 1
     - Latency tracking and performance metrics
     - Streaming illusion support
+    - Backpressure handling
     """
     
     def __init__(self):
@@ -78,6 +79,11 @@ class SeamlessM4TProcessor:
         self.bandpass_high_freq = 8000.0 # Hz
         self.agc_target_level = 0.7
         self.agc_max_gain = 3.0
+        
+        # Backpressure handling
+        self.max_queue_size = 10  # Maximum chunks in processing queue
+        self.processing_queue = asyncio.Queue(maxsize=self.max_queue_size)
+        self.processing_semaphore = asyncio.Semaphore(3)  # Limit concurrent processing
         
         # Supported language codes for SeamlessM4T v2
         self.language_mapping = {
@@ -115,6 +121,7 @@ class SeamlessM4TProcessor:
         self.total_processed = 0
         self.processing_times = []
         self.latency_metrics = []
+        self.backpressure_events = 0
         
         # Audio processing state
         self.hp_prev_input = 0.0
@@ -155,7 +162,8 @@ class SeamlessM4TProcessor:
         audio_data: str,
         source_language: str,
         target_language: str,
-        session_id: str
+        session_id: str,
+        sequence_id: Optional[int] = None
     ) -> TranslationResult:
         """
         Translate audio data using SeamlessM4T v2 for speech-to-speech translation.
@@ -165,6 +173,7 @@ class SeamlessM4TProcessor:
             source_language: Source language code (e.g., "en", "hi")
             target_language: Target language code (e.g., "en", "hi")
             session_id: Session identifier for logging
+            sequence_id: Sequence ID for ordering and acknowledgment
             
         Returns:
             TranslationResult with translated audio and metadata
@@ -181,42 +190,36 @@ class SeamlessM4TProcessor:
             if not self._is_language_supported(source_language, target_language):
                 raise ProcessorError(f"Unsupported language pair: {source_language} -> {target_language}")
             
-            # Step 1: Decode and preprocess audio
-            audio_bytes = base64.b64decode(audio_data)
-            preprocessed_audio = self._preprocess_audio(audio_bytes)
+            # Apply backpressure if queue is full
+            if self.processing_queue.full():
+                self.backpressure_events += 1
+                logger.warning(f"Backpressure event for session {session_id}. Queue size: {self.processing_queue.qsize()}")
+                
+                # Drop oldest item if queue is at maximum capacity
+                if self.processing_queue.qsize() >= self.max_queue_size:
+                    try:
+                        self.processing_queue.get_nowait()
+                        logger.info(f"Dropped oldest chunk for session {session_id} due to backpressure")
+                    except asyncio.QueueEmpty:
+                        pass
             
-            # Step 2: Send to SeamlessM4T API
-            latency_tracker.request_sent = time.time()
-            translated_audio = await self._translate_with_seamless_m4t(
-                preprocessed_audio,
-                source_language,
-                target_language
-            )
-            latency_tracker.response_received = time.time()
+            # Add to processing queue
+            processing_item = {
+                "audio_data": audio_data,
+                "source_language": source_language,
+                "target_language": target_language,
+                "session_id": session_id,
+                "sequence_id": sequence_id,
+                "start_time": start_time,
+                "latency_tracker": latency_tracker
+            }
             
-            # Step 3: Post-process translated audio
-            final_audio = self._postprocess_audio(translated_audio)
+            await self.processing_queue.put(processing_item)
             
-            # Step 4: Calculate metrics
-            processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-            latency_tracker.playback_start = time.time()
+            # Process with concurrency limit
+            async with self.processing_semaphore:
+                result = await self._process_translation_item(processing_item)
             
-            # Update statistics
-            self.total_processed += 1
-            self.processing_times.append(processing_time)
-            self.latency_metrics.append(latency_tracker.to_dict())
-            
-            # Create result
-            result = TranslationResult(
-                text=self._extract_text_placeholder(final_audio),
-                is_final=True,
-                confidence=0.85,  # Simulated confidence
-                source_language=source_language,
-                target_language=target_language,
-                processing_time_ms=processing_time
-            )
-            
-            logger.debug(f"S2S translation completed for session {session_id}")
             return result
             
         except ProcessorError:
@@ -224,6 +227,53 @@ class SeamlessM4TProcessor:
         except Exception as e:
             logger.error(f"S2S translation error for session {session_id}: {e}")
             raise ProcessorError(f"S2S translation failed: {str(e)}")
+    
+    async def _process_translation_item(self, item: Dict[str, Any]) -> TranslationResult:
+        """Process a single translation item from the queue."""
+        audio_data = item["audio_data"]
+        source_language = item["source_language"]
+        target_language = item["target_language"]
+        session_id = item["session_id"]
+        start_time = item["start_time"]
+        latency_tracker = item["latency_tracker"]
+        
+        # Step 1: Decode and preprocess audio
+        audio_bytes = base64.b64decode(audio_data)
+        preprocessed_audio = self._preprocess_audio(audio_bytes)
+        
+        # Step 2: Send to SeamlessM4T API
+        latency_tracker.request_sent = time.time()
+        translated_audio = await self._translate_with_seamless_m4t(
+            preprocessed_audio,
+            source_language,
+            target_language
+        )
+        latency_tracker.response_received = time.time()
+        
+        # Step 3: Post-process translated audio
+        final_audio = self._postprocess_audio(translated_audio)
+        
+        # Step 4: Calculate metrics
+        processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+        latency_tracker.playback_start = time.time()
+        
+        # Update statistics
+        self.total_processed += 1
+        self.processing_times.append(processing_time)
+        self.latency_metrics.append(latency_tracker.to_dict())
+        
+        # Create result
+        result = TranslationResult(
+            text=self._extract_text_placeholder(final_audio),
+            is_final=True,
+            confidence=0.85,  # Simulated confidence
+            source_language=source_language,
+            target_language=target_language,
+            processing_time_ms=processing_time
+        )
+        
+        logger.debug(f"S2S translation completed for session {session_id}")
+        return result
     
     def _preprocess_audio(self, audio_bytes: bytes) -> bytes:
         """
@@ -330,7 +380,7 @@ class SeamlessM4TProcessor:
             "parameters": {
                 "generation_config": {
                     "max_new_tokens": 1024,
-                    "do_sample": false
+                    "do_sample": False
                 }
             }
         }
@@ -453,10 +503,9 @@ class SeamlessM4TProcessor:
             model_name="facebook/seamless-m4t-v2-large",
             supported_languages=list(self.language_mapping.keys()),
             memory_usage_mb=None,  # Not applicable for API-based model
-            queue_size=0,  # Not using queue in this implementation
+            queue_size=self.processing_queue.qsize(),
             total_processed=self.total_processed,
             avg_processing_time_ms=avg_processing_time,
-            avg_total_latency_ms=avg_total_latency,
             avg_network_latency_ms=avg_network_latency
         )
     

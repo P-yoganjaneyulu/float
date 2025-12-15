@@ -43,6 +43,15 @@ enum class MessageType {
 }
 
 /**
+ * Data class to hold unacknowledged audio chunks for resend functionality.
+ */
+data class UnacknowledgedChunk(
+    val sequenceId: Long,
+    val timestamp: Long,
+    val jsonData: String
+)
+
+/**
  * Robust WebSocket client for the FLOAT translation service.
  * Implements exponential backoff reconnection, proper JSON contract enforcement,
  * and resilient error handling for production use.
@@ -85,6 +94,10 @@ class TranslatorWebSocket @Inject constructor(
     private var chunkIndex = 0
     private var reconnectDelay = 1000L // Start with 1 second
     private var reconnectAttempts = 0
+    
+    // Resendable client-side audio buffer
+    private val unacknowledgedChunks = mutableMapOf<Long, UnacknowledgedChunk>()
+    private var lastAcknowledgedSequenceId: Long = 0
     
     // Default configuration
     private var config = WebSocketConfig(
@@ -152,20 +165,6 @@ class TranslatorWebSocket @Inject constructor(
      */
     fun setLatencyCallback(callback: WebSocketLatencyCallback) {
         latencyCallback = callback
-    }
-    
-    /**
-     * Initialize WebSocket client with configuration.
-     */
-    fun initialize(webSocketConfig: WebSocketConfig) {
-        config = webSocketConfig
-        
-        okHttpClient = OkHttpClient.Builder()
-            .connectTimeout(config.connectionTimeout, TimeUnit.MILLISECONDS)
-            .readTimeout(config.connectionTimeout, TimeUnit.MILLISECONDS)
-            .pingInterval(30000, TimeUnit.MILLISECONDS) // 30 second ping interval
-            .retryOnConnectionFailure(true)
-            .build()
     }
     
     /**
@@ -238,15 +237,25 @@ class TranslatorWebSocket @Inject constructor(
             // Encode audio data to base64
             val base64Audio = android.util.Base64.encodeToString(audioData, android.util.Base64.NO_WRAP)
             
+            val sequenceId = System.currentTimeMillis()
             val outboundMessage = OutboundMessage(
                 session_id = session.sessionId,
                 chunk_index = chunkIndex++,
+                sequence_id = sequenceId,
                 language_pair = session.languagePair,
                 audio_chunk = base64Audio,
                 timestamp = System.currentTimeMillis()
             )
             
             val messageJson = json.encodeToString(outboundMessage)
+            
+            // Store chunk for potential resend
+            unacknowledgedChunks[sequenceId] = UnacknowledgedChunk(
+                sequenceId = sequenceId,
+                timestamp = System.currentTimeMillis(),
+                jsonData = messageJson
+            )
+            
             val success = webSocket?.send(messageJson) ?: false
             
             // Notify latency callback of network send
@@ -302,6 +311,26 @@ class TranslatorWebSocket @Inject constructor(
             while (isActive && _isConnected.value) {
                 delay(config.keepaliveInterval)
                 sendKeepalive()
+            }
+        }
+        
+        // Resend unacknowledged chunks after reconnection
+        resendUnacknowledgedChunks()
+    }
+    
+    /**
+     * Resend all unacknowledged chunks after reconnection.
+     */
+    private fun resendUnacknowledgedChunks() {
+        webSocketScope.launch {
+            // Filter out chunks that have already been acknowledged
+            val chunksToResend = unacknowledgedChunks.values.filter { 
+                it.sequenceId > lastAcknowledgedSequenceId 
+            }.sortedBy { it.timestamp }
+            
+            // Send chunks in order
+            for (chunk in chunksToResend) {
+                webSocket?.send(chunk.jsonData)
             }
         }
     }
@@ -360,6 +389,21 @@ class TranslatorWebSocket @Inject constructor(
                 
                 "keepalive" -> {
                     // Server keepalive, no action needed
+                }
+                
+                "ack" -> {
+                    // Handle acknowledgment of sent chunks
+                    inboundMessage.ack_sequence_id?.let { ackSeqId ->
+                        // Remove acknowledged chunks from our buffer
+                        unacknowledgedChunks.entries.removeIf { entry ->
+                            entry.key <= ackSeqId
+                        }
+                        
+                        // Update last acknowledged sequence ID
+                        if (ackSeqId > lastAcknowledgedSequenceId) {
+                            lastAcknowledgedSequenceId = ackSeqId
+                        }
+                    }
                 }
                 
                 else -> {
@@ -473,7 +517,8 @@ class TranslatorWebSocket @Inject constructor(
             lastConnectedTime = _connectionState.value.lastConnectedTime,
             totalChunks = currentSession?.totalChunks ?: 0,
             successfulTranslations = currentSession?.successfulTranslations ?: 0,
-            failedTranslations = currentSession?.failedTranslations ?: 0
+            failedTranslations = currentSession?.failedTranslations ?: 0,
+            unacknowledgedChunks = unacknowledgedChunks.size
         )
     }
     
@@ -510,7 +555,8 @@ class TranslatorWebSocket @Inject constructor(
         val lastConnectedTime: Long,
         val totalChunks: Int,
         val successfulTranslations: Int,
-        val failedTranslations: Int
+        val failedTranslations: Int,
+        val unacknowledgedChunks: Int = 0 // Track unacknowledged chunks
     )
     
     /**

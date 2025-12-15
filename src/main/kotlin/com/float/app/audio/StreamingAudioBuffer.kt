@@ -31,6 +31,11 @@ class StreamingAudioBuffer {
         private const val CROSS_FADE_MS = 15
         private const val FADE_IN_MS = 10
         private const val FADE_OUT_MS = 10
+        
+        // Constants for reliability enhancements
+        private const val REORDERING_WINDOW_MS = 300 // 300ms reordering window
+        private const val MIN_BUFFERED_AUDIO_MS = 200 // Minimum 200ms buffered before playback
+        private const val MAX_BUFFER_SIZE = 100 // Maximum chunks in buffer
     }
     
     private var audioTrack: AudioTrack? = null
@@ -43,9 +48,17 @@ class StreamingAudioBuffer {
     private val _latencyMs = MutableStateFlow(0f)
     val latencyMs: StateFlow<Float> = _latencyMs.asStateFlow()
     
-    private val audioQueue = ConcurrentLinkedQueue<AudioChunk>()
-    private var previousChunk: AudioChunk? = null
+    // Enhanced audio queue with sequencing for out-of-order handling
+    private val audioQueue = ConcurrentLinkedQueue<SequencedAudioChunk>()
+    private val reorderingBuffer = mutableMapOf<Int, SequencedAudioChunk>() // For out-of-order chunks
+    private var previousChunk: SequencedAudioChunk? = null
+    private var expectedChunkIndex = 0 // Expected next chunk index
     private var playbackJob: Job? = null
+    private var lastPlaybackTime = 0L
+    
+    // Adaptive jitter buffer
+    private val bufferedAudioTimes = mutableListOf<Long>() // Track timing for jitter calculation
+    private var jitterBufferThresholdMs = MIN_BUFFERED_AUDIO_MS.toFloat()
     
     private val bufferSize: Int by lazy {
         AudioTrack.getMinBufferSize(
@@ -55,12 +68,23 @@ class StreamingAudioBuffer {
         ) * BUFFER_SIZE_FACTOR
     }
     
-    data class AudioChunk(
+    data class SequencedAudioChunk(
         val data: ByteArray,
+        val index: Int, // Chunk sequence index
         val timestamp: Long = System.currentTimeMillis(),
         val sampleRate: Int = SAMPLE_RATE,
         val channels: Int = 1
-    )
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is SequencedAudioChunk) return false
+            return index == other.index
+        }
+        
+        override fun hashCode(): Int {
+            return index.hashCode()
+        }
+    }
     
     enum class PlaybackState {
         STOPPED,
@@ -109,20 +133,53 @@ class StreamingAudioBuffer {
     /**
      * Add audio chunk to playback queue with ALL client-side post-processing.
      */
-    fun addAudioChunk(rawData: ByteArray) {
+    fun addAudioChunk(rawData: ByteArray, chunkIndex: Int = expectedChunkIndex) {
         if (!isInitialized) return
         
         val startTime = System.currentTimeMillis()
         
-        // Apply ALL post-processing on client side
-        val processedData = postProcessAudioChunk(rawData)
-        
-        val chunk = AudioChunk(
-            data = processedData,
-            timestamp = startTime
-        )
-        
-        audioQueue.offer(chunk)
+        // Validate PCM integrity before processing
+        if (!validatePCMIntegrity(rawData)) {
+            // Replace corrupted chunk with silence
+            val silenceData = createSilenceFrame(rawData.size)
+            val chunk = SequencedAudioChunk(
+                data = silenceData,
+                index = chunkIndex,
+                timestamp = startTime
+            )
+            audioQueue.offer(chunk)
+        } else {
+            // Apply ALL post-processing on client side
+            val processedData = postProcessAudioChunk(rawData)
+            
+            val chunk = SequencedAudioChunk(
+                data = processedData,
+                index = chunkIndex,
+                timestamp = startTime
+            )
+            
+            // Handle out-of-order chunks
+            if (chunkIndex == expectedChunkIndex) {
+                // In-order chunk, add directly to queue
+                audioQueue.offer(chunk)
+                expectedChunkIndex++
+                
+                // Check if any buffered out-of-order chunks can now be processed
+                processReorderedChunks()
+            } else if (chunkIndex > expectedChunkIndex) {
+                // Future chunk, buffer it temporarily if within reordering window
+                val timeDiff = chunk.timestamp - System.currentTimeMillis()
+                if (abs(timeDiff) <= REORDERING_WINDOW_MS) {
+                    reorderingBuffer[chunkIndex] = chunk
+                } else {
+                    // Too far in future, drop it
+                    // Could insert silence here if needed
+                }
+            } else {
+                // Past chunk, likely duplicate, drop it
+                // Could implement deduplication logic here if needed
+            }
+        }
         
         // Update latency metric and notify callback
         val processingTime = System.currentTimeMillis() - startTime
@@ -130,10 +187,90 @@ class StreamingAudioBuffer {
         
         latencyCallback?.onChunkProcessed(processingTime.toFloat())
         
-        // Start playback if not already playing
-        if (!isPlaying && audioQueue.isNotEmpty()) {
+        // Start playback if not already playing and we have enough buffered audio
+        if (!isPlaying && shouldStartPlayback()) {
             startPlayback()
         }
+    }
+    
+    /**
+     * Process any reordered chunks that can now be added to the main queue.
+     */
+    private fun processReorderedChunks() {
+        while (reorderingBuffer.containsKey(expectedChunkIndex)) {
+            val chunk = reorderingBuffer.remove(expectedChunkIndex)
+            chunk?.let {
+                audioQueue.offer(it)
+                expectedChunkIndex++
+            }
+        }
+    }
+    
+    /**
+     * Check if we have enough buffered audio to start playback.
+     */
+    private fun shouldStartPlayback(): Boolean {
+        if (audioQueue.isEmpty()) return false
+        
+        // Calculate total buffered audio time
+        val bufferedTimeMs = calculateBufferedAudioTime()
+        
+        // Start playback when we have at least the minimum buffered time
+        return bufferedTimeMs >= jitterBufferThresholdMs
+    }
+    
+    /**
+     * Calculate total buffered audio time in milliseconds.
+     */
+    private fun calculateBufferedAudioTime(): Float {
+        if (audioQueue.isEmpty()) return 0f
+        
+        // Estimate based on chunk size (assuming ~200ms chunks)
+        val chunkDurationMs = 200f // Approximate duration per chunk
+        return audioQueue.size * chunkDurationMs
+    }
+    
+    /**
+     * Validate PCM integrity to prevent corrupted audio from reaching playback.
+     */
+    private fun validatePCMIntegrity(data: ByteArray): Boolean {
+        // Check for empty data
+        if (data.isEmpty()) return false
+        
+        // Check for minimum size (at least one sample)
+        if (data.size < 2) return false
+        
+        // Convert to samples for validation
+        val samples = data.chunked(2).map { bytes ->
+            ((bytes[1].toInt() shl 8) or (bytes[0].toInt() and 0xFF)).toShort()
+        }
+        
+        // Check for NaN or infinite values (though not applicable to integer PCM)
+        // Check amplitude bounds
+        for (sample in samples) {
+            // PCM 16-bit should be within Short range
+            if (sample < Short.MIN_VALUE || sample > Short.MAX_VALUE) {
+                return false
+            }
+        }
+        
+        // Check for excessive zero samples (potential silence/corruption)
+        val zeroSampleCount = samples.count { it == 0.toShort() }
+        val zeroRatio = zeroSampleCount.toFloat() / samples.size
+        
+        // If more than 95% of samples are zero, consider it corrupted
+        if (zeroRatio > 0.95f) {
+            return false
+        }
+        
+        return true
+    }
+    
+    /**
+     * Create a silence frame of specified size.
+     */
+    private fun createSilenceFrame(size: Int): ByteArray {
+        return ByteArray(size) { 0 }
     }
     
     /**
@@ -154,7 +291,11 @@ class StreamingAudioBuffer {
         
         // 2. Cross-fade with previous chunk if available
         previousChunk?.let { prevChunk ->
-            processedSamples = crossFadeWithPrevious(prevChunk, processedSamples)
+            // Convert previous chunk data to samples
+            val prevSamples = prevChunk.data.chunked(2).map { bytes ->
+                ((bytes[1].toInt() shl 8) or (bytes[0].toInt() and 0xFF)).toShort()
+            }.toShortArray()
+            processedSamples = crossFadeWithPrevious(prevSamples, processedSamples)
         }
         
         // 3. Soft fade-in and fade-out
@@ -170,8 +311,10 @@ class StreamingAudioBuffer {
         processedSamples = applyEmotionFlattening(processedSamples)
         
         // Store current chunk for next cross-fade
-        previousChunk = AudioChunk(
+        // We'll store the processed chunk for cross-fading
+        previousChunk = SequencedAudioChunk(
             data = processedSamples.toByteArray(),
+            index = 0, // Index not important for previous chunk storage
             timestamp = System.currentTimeMillis()
         )
         
@@ -205,11 +348,7 @@ class StreamingAudioBuffer {
     /**
      * Cross-fade with previous audio chunk.
      */
-    private fun crossFadeWithPrevious(prevChunk: AudioChunk, currentSamples: ShortArray): ShortArray {
-        val prevSamples = prevChunk.data.chunked(2).map { bytes ->
-            ((bytes[1].toInt() shl 8) or (bytes[0].toInt() and 0xFF)).toShort()
-        }.toShortArray()
-        
+    private fun crossFadeWithPrevious(prevSamples: ShortArray, currentSamples: ShortArray): ShortArray {
         val crossFadeSamples = (CROSS_FADE_MS * SAMPLE_RATE / 1000).coerceAtMost(
             min(prevSamples.size, currentSamples.size) / 4
         )
@@ -366,7 +505,15 @@ class StreamingAudioBuffer {
             
             audioTrack?.play()
             
-            while (isActive && audioQueue.isNotEmpty()) {
+            while (isActive) {
+                // Check if we need to buffer more audio
+                if (audioQueue.isEmpty()) {
+                    // Handle buffer underrun
+                    handleBufferUnderrun()
+                    delay(10) // Small delay to prevent busy waiting
+                    continue
+                }
+                
                 val chunk = audioQueue.poll() ?: break
                 
                 // Write to audio track
@@ -377,6 +524,9 @@ class StreamingAudioBuffer {
                     break
                 }
                 
+                // Update last playback time
+                lastPlaybackTime = System.currentTimeMillis()
+                
                 // Small delay to prevent busy waiting
                 delay(1)
             }
@@ -384,6 +534,15 @@ class StreamingAudioBuffer {
             isPlaying = false
             _playbackState.value = PlaybackState.STOPPED
         }
+    }
+    
+    /**
+     * Handle buffer underrun by filling with silence.
+     */
+    private fun handleBufferUnderrun() {
+        // Create a small silence frame to prevent abrupt stops
+        val silenceFrame = createSilenceFrame(1024) // 1KB of silence
+        audioTrack?.write(silenceFrame, 0, silenceFrame.size)
     }
     
     /**
@@ -396,7 +555,9 @@ class StreamingAudioBuffer {
         isPlaying = false
         _playbackState.value = PlaybackState.STOPPED
         audioQueue.clear()
+        reorderingBuffer.clear()
         previousChunk = null
+        expectedChunkIndex = 0
     }
     
     /**

@@ -28,6 +28,7 @@ class MessageType(str, Enum):
     ERROR = "error"
     KEEPALIVE = "keepalive"
     CONNECTED = "connected"
+    ACK = "ack"  # Acknowledgment message
 
 
 class ErrorCode(str, Enum):
@@ -47,6 +48,7 @@ class InboundMessage(BaseModel):
     """Inbound WebSocket message from client."""
     session_id: str = Field(..., description="Unique session identifier")
     chunk_index: int = Field(..., description="Audio chunk index")
+    sequence_id: Optional[int] = Field(None, description="Sequence ID for ordering")
     language_pair: Dict[str, str] = Field(..., description="Source and target languages")
     audio_chunk: str = Field(..., description="Base64 encoded audio data")
     timestamp: Optional[int] = Field(None, description="Message timestamp")
@@ -57,6 +59,8 @@ class OutboundMessage(BaseModel):
     session_id: str = Field(..., description="Unique session identifier")
     message_type: MessageType = Field(..., description="Message type")
     chunk_index: Optional[int] = Field(None, description="Associated chunk index")
+    sequence_id: Optional[int] = Field(None, description="Sequence ID for ordering")
+    ack_sequence_id: Optional[int] = Field(None, description="Acknowledged sequence ID")
     partial_transcript: Optional[str] = Field(None, description="Partial translation text")
     final_transcript: Optional[str] = Field(None, description="Final translation text")
     confidence: Optional[float] = Field(None, description="Translation confidence score")
@@ -84,6 +88,7 @@ class SessionInfo(BaseModel):
     last_activity: datetime = Field(..., description="Last activity time")
     message_count: int = Field(default=0, description="Number of messages processed")
     chunks_processed: int = Field(default=0, description="Number of audio chunks processed")
+    last_acknowledged_seq: int = Field(default=0, description="Last acknowledged sequence ID")
 
 
 class ServerError(BaseModel):
@@ -114,6 +119,7 @@ class ConnectionStats(BaseModel):
     successful_translations: int = Field(default=0, description="Successful translations")
     failed_translations: int = Field(default=0, description="Failed translations")
     avg_processing_time: float = Field(default=0.0, description="Average processing time in ms")
+    backpressure_events: int = Field(default=0, description="Number of backpressure events")
     
     def get_success_rate(self) -> float:
         """Calculate success rate as percentage."""
